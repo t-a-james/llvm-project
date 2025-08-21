@@ -2004,6 +2004,34 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
                      << pattern;
   }
 
+  if (!args.hasArg(OPT_as_needed) &&
+      (args.hasArg(OPT_as_needed_diagnostics) ||
+       args.hasArg(OPT_as_needed_diagnostics_exclude))) {
+    Warn(ctx) << "'--as-needed-diagnostics' and "
+                 "'--as-needed-diagnostics-exclude' are redundant unless "
+                 "'--as-needed' is specified.";
+  } else if (!args.hasArg(OPT_as_needed_diagnostics) &&
+             args.hasArg(OPT_as_needed_diagnostics_exclude)) {
+    Warn(ctx)
+        << "'--as-needed-diagnostics-exclude' specified but "
+           "'--as-needed-diagnostics' not present. Nothing will be logged.";
+  } else {
+    typedef llvm::opt::arg_iterator<llvm::opt::Arg *const *, 1U> arg_iterator;
+    iterator_range<arg_iterator> asNeededExcludeArgs =
+        args.filtered(OPT_as_needed_diagnostics_exclude);
+    ctx.arg.asNeededDiagnosticsExclude.reserve(
+        std::distance(asNeededExcludeArgs.begin(), asNeededExcludeArgs.end()));
+    for (const opt::Arg *arg : asNeededExcludeArgs) {
+      StringRef pattern(arg->getValue());
+      if (Expected<GlobPattern> pat = GlobPattern::create(pattern)) {
+        ctx.arg.asNeededDiagnosticsExclude.push_back(std::move(*pat));
+      } else {
+        ErrAlways(ctx) << arg->getSpelling() << ": " << pat.takeError() << ": "
+                       << pattern;
+      }
+    }
+  }
+
   // For -no-pie and -pie, --export-dynamic-symbol specifies defined symbols
   // which should be exported. For -shared, references to matched non-local
   // STV_DEFAULT symbols are not bound to definitions within the shared object,
@@ -2266,6 +2294,9 @@ void LinkerDriver::createFiles(opt::InputArgList &args) {
       break;
     case OPT_as_needed:
       ctx.arg.asNeeded = true;
+      break;
+    case OPT_as_needed_diagnostics:
+      ctx.arg.asNeededDiagnostics = true;
       break;
     case OPT_format:
       ctx.arg.formatBinary = isFormatBinary(ctx, arg->getValue());
@@ -3647,6 +3678,50 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
         readCallGraph(ctx, *buffer);
     } else
       readCallGraphsFromObjectFiles<ELFT>(ctx);
+  }
+
+  if (ctx.arg.asNeededDiagnostics) {
+    SmallVector<SharedFile const *> neededFiles;
+    neededFiles.reserve(ctx.sharedFiles.size());
+    std::copy_if(ctx.sharedFiles.begin(), ctx.sharedFiles.end(),
+                 std::back_inserter(neededFiles),
+                 [](SharedFile const *file) { return file->isNeeded.load(); });
+    for (SharedFile const *file : ctx.sharedFiles) {
+      if (file->isNeeded) {
+        continue;
+      }
+      bool isExcluded = std::any_of(ctx.arg.asNeededDiagnosticsExclude.begin(),
+                                    ctx.arg.asNeededDiagnosticsExclude.end(),
+                                    [file](const llvm::GlobPattern &pat) {
+                                      return pat.match(file->soName) ||
+                                             pat.match(file->getName());
+                                    });
+      if (isExcluded) {
+        continue;
+      }
+      // Any linked library that has the unneeded library in its DT_NEEDED
+      // may have pulled the unneeded library in transitively.
+      SmallVector<StringRef> linkSourceCandidates;
+      for (SharedFile const *neededFile : neededFiles) {
+        bool linksToUnneeded = std::any_of(
+            neededFile->dtNeeded.begin(), neededFile->dtNeeded.end(),
+            [file](StringRef entry) { return entry == file->soName; });
+        if (!linksToUnneeded) {
+          continue;
+        }
+        linkSourceCandidates.emplace_back(neededFile->soName);
+      }
+      ELFSyncStream msg(ctx, DiagLevel::Warn);
+      msg << ctx.arg.outputFile << " links against "
+          << file->soName << " (" << file->getName()
+          << ") but this link is not required. ";
+      if (!linkSourceCandidates.empty()) {
+        msg << "\n>>> This may be a transitive link from the build system, as "
+               "the following files share this dependency: "
+            << file->soName << ":\n"
+            << llvm::join(std::move(linkSourceCandidates), ", ");
+      }
+    }
   }
 
   // Write the result to the file.
